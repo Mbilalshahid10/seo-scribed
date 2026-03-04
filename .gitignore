@@ -42,3 +42,11 @@ certificates
 
 .claude/settings.local.json
 CLAUDE.md
+
+# local-only directories
+/docs
+/analytics
+/scripts
+
+# build artifacts
+*.tsbuildinfo
