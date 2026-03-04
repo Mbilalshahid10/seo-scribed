@@ -1,7 +1,6 @@
 'use client'
 
 import { useState } from 'react'
-import { createClient } from '@/utils/supabase/client'
 import { trackEvent } from '@/lib/posthog'
 import { trackMeta } from '@/utils/trackMeta'
 import { gtagEvent, trackGoogleAdsLeadConversion } from '@/lib/gtag'
@@ -30,108 +29,69 @@ export default function BetaSignupForm() {
       })
 
       try {
-        if (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
-          const supabase = createClient()
+        const cookies = parseCookie()
+        const existingGuestId = cookies[GUEST_ID_COOKIE_NAME]
 
-          const cookies = parseCookie()
-          const existingGuestId = cookies[GUEST_ID_COOKIE_NAME]
+        // Read UTMs directly from the current URL only
+        const urlParams = new URLSearchParams(window.location.search)
 
-          // Read UTMs directly from the current URL only
-          const urlParams = new URLSearchParams(window.location.search)
-          const utmSource = urlParams.get('utm_source')
-          const utmMedium = urlParams.get('utm_medium')
-          const utmCampaign = urlParams.get('utm_campaign')
-          const utmTerm = urlParams.get('utm_term')
-          const utmContent = urlParams.get('utm_content')
-          const hasUrlUtms = !!(utmSource || utmMedium || utmCampaign || utmTerm || utmContent)
+        // Read attribution cookie for referrer (captured on first page load)
+        let initialReferrer: string | null = null
+        try {
+          const rawAttr = cookies[ATTR_COOKIE_NAME]
+          if (rawAttr) {
+            const attrData = JSON.parse(decodeURIComponent(rawAttr))
+            initialReferrer = attrData.initial_referrer || null
+          }
+        } catch {
+          // ignore malformed cookie
+        }
 
-          let error = null as unknown as { message: string; code?: string | null } | null
-          let staleCookie = false
+        const res = await fetch('/api/lead-signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email,
+            existingGuestId: existingGuestId || undefined,
+            utmData: {
+              utm_source: urlParams.get('utm_source'),
+              utm_medium: urlParams.get('utm_medium'),
+              utm_campaign: urlParams.get('utm_campaign'),
+              utm_term: urlParams.get('utm_term'),
+              utm_content: urlParams.get('utm_content'),
+            },
+            landingPage: window.location.pathname,
+            referrer: initialReferrer,
+          }),
+        })
 
-          if (existingGuestId) {
-            const { data: updatedRow, error: updateError } = await supabase
-              .from('guest_users')
-              .update({
-                email,
-                source: 'landing_page_cta_lead',
-                last_seen_at: new Date().toISOString(),
-                // Only overwrite UTM fields if the current URL has UTMs
-                ...(hasUrlUtms ? {
-                  utm_source: utmSource,
-                  utm_medium: utmMedium,
-                  utm_campaign: utmCampaign,
-                  utm_term: utmTerm,
-                  utm_content: utmContent,
-                  landing_page: window.location.pathname,
-                } : {}),
-              })
-              .eq('id', existingGuestId)
-              .select('id')
-              .maybeSingle()
+        const data = await res.json()
 
-            if (updateError) {
-              error = updateError as typeof error
-            } else if (!updatedRow) {
-              // Row was deleted but cookie persisted — clear stale cookie and fall through to INSERT
+        if (!res.ok) {
+          trackEvent('lead_capture_failed', {
+            source: 'landing_page_cta',
+            email,
+            error_message: data.error || 'Unknown error',
+            error_code: data.code ?? undefined,
+          })
+        } else {
+          // If this was a new insert (or stale cookie fallback), set the guest ID cookie
+          if (data.isNew && data.guestId) {
+            // Clear stale cookie if it existed
+            if (existingGuestId) {
               document.cookie = `${GUEST_ID_COOKIE_NAME}=; Path=/; Max-Age=0`
-              staleCookie = true
             }
+            const maxAge = ATTR_COOKIE_MAX_AGE_DAYS * 24 * 60 * 60
+            document.cookie = `${GUEST_ID_COOKIE_NAME}=${data.guestId}; Path=/; Max-Age=${maxAge}; SameSite=Lax`
           }
 
-          if (!existingGuestId || staleCookie) {
-            // Read attribution cookie for referrer (captured on first page load)
-            let initialReferrer: string | null = null
-            try {
-              const rawAttr = cookies[ATTR_COOKIE_NAME]
-              if (rawAttr) {
-                const attrData = JSON.parse(decodeURIComponent(rawAttr))
-                initialReferrer = attrData.initial_referrer || null
-              }
-            } catch {
-              // ignore malformed cookie
-            }
+          trackEvent('lead_captured', {
+            source: 'landing_page_cta',
+            email,
+          })
 
-            const { data: insertData, error: insertError } = await supabase
-              .from('guest_users')
-              .insert({
-                email,
-                source: 'landing_page_cta_lead',
-                utm_source: utmSource || null,
-                utm_medium: utmMedium || null,
-                utm_campaign: utmCampaign || null,
-                utm_term: utmTerm || null,
-                utm_content: utmContent || null,
-                landing_page: window.location.pathname,
-                referrer: initialReferrer,
-              })
-              .select('id')
-              .single()
-
-            error = insertError as typeof error
-
-            // Set the guest ID cookie so re-submissions update instead of duplicating
-            if (!insertError && insertData) {
-              const maxAge = ATTR_COOKIE_MAX_AGE_DAYS * 24 * 60 * 60
-              document.cookie = `${GUEST_ID_COOKIE_NAME}=${insertData.id}; Path=/; Max-Age=${maxAge}; SameSite=Lax`
-            }
-          }
-
-          if (error) {
-            trackEvent('lead_capture_failed', {
-              source: 'landing_page_cta',
-              email,
-              error_message: error.message,
-              error_code: error.code ?? undefined,
-            })
-          } else {
-            trackEvent('lead_captured', {
-              source: 'landing_page_cta',
-              email,
-            })
-
-            await trackMeta('Lead', { email })
-            trackGoogleAdsLeadConversion({ email })
-          }
+          await trackMeta('Lead', { email })
+          trackGoogleAdsLeadConversion({ email })
         }
       } catch (storageError) {
         trackEvent('lead_capture_failed', {
